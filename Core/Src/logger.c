@@ -61,6 +61,10 @@ static uint32_t logger_next_poll_tick = 0U;
 static FIL     logger_file;
 static bool    logger_file_open = false;
 
+/* Власний 64-бітний лічильник часу та пам'ять для попереднього тіку */
+static uint64_t logger_uptime_ms = 0U;
+static uint32_t logger_last_tick = 0U;
+
 /* ------------------------------------------------------------------------- */
 /* Локальні функції                                                          */
 /* ------------------------------------------------------------------------- */
@@ -96,9 +100,9 @@ static uint8_t Logger_Debounce8(uint8_t sample)
 /* Отримання часу у форматі "секунди, мілісекунди" від моменту старту */
 static void Logger_GetTime(uint32_t *sec, uint16_t *ms)
 {
-    uint32_t t = HAL_GetTick();   /* мс від запуску */
-    *sec = t / 1000U;
-    *ms  = (uint16_t)(t % 1000U);
+    /* Використовуємо наш 64-бітний час */
+    *sec = (uint32_t)(logger_uptime_ms / 1000ULL);
+    *ms  = (uint16_t)(logger_uptime_ms % 1000ULL);
 }
 
 /* Запис одного рядка у CSV-файл */
@@ -147,16 +151,19 @@ static void Logger_WriteLine(uint8_t bits)
 /*
  * Ініціалізація логера.
  *
- *  - монтування файлової системи на SD-карті;
- *  - відкриття (або створення) файлу "log.csv" в режимі допису;
- *  - додавання заголовка, якщо файл тільки-но створено;
- *  - ініціалізація внутрішніх змінних дебаунсу й опитування.
+ * - монтування файлової системи на SD-карті;
+ * - пошук першого вільного імені файлу (log_000.csv ... log_999.csv);
+ * - створення файлу та додавання заголовка;
+ * - ініціалізація внутрішніх змінних дебаунсу й опитування.
  *
  * Повертає 0 при успіху, від'ємне значення у випадку помилки.
  */
 int Logger_Init(void)
 {
     FRESULT fr;
+    FILINFO fno;
+    char filename[16];
+    int file_idx = 0;
 
     logger_state           = 0U;
     logger_cnt0            = 0U;
@@ -172,9 +179,25 @@ int Logger_Init(void)
         return -1;
     }
 
-    /* Відкриття файлу в режимі допису (курсором в кінець) */
-    fr = f_open(&logger_file, "/log.csv", FA_WRITE | FA_OPEN_ALWAYS);
+    /* Пошук першого вільного імені файлу від log_000.csv до log_999.csv */
+    do {
+        snprintf(filename, sizeof(filename), "/log_%03d.csv", file_idx);
+        fr = f_stat(filename, &fno);
+        if (fr == FR_NO_FILE)
+        {
+            break; /* Знайшли вільне ім'я! */
+        }
+        file_idx++;
+    } while (file_idx <= 999);
 
+    /* Якщо всі 1000 імен зайняті, повертаємо помилку */
+    if (file_idx > 999)
+    {
+        return -3;
+    }
+
+    /* Відкриття файлу (створення нового) */
+    fr = f_open(&logger_file, filename, FA_WRITE | FA_CREATE_ALWAYS);
     if (fr != FR_OK)
     {
         return -2;
@@ -182,14 +205,11 @@ int Logger_Init(void)
 
     logger_file_open = true;
 
-    /* Якщо файл новий (розмір 0) – записати заголовок */
-    if (f_size(&logger_file) == 0U)
-    {
-        const char header[] = "Time,ch1,ch2,ch3,ch4,ch5,ch6,ch7,ch8\r\n";
-        UINT bw;
-        f_write(&logger_file, header, (UINT)strlen(header), &bw);
-        f_sync(&logger_file);
-    }
+    /* Оскільки файл гарантовано новий, одразу записуємо заголовок */
+    const char header[] = "Time,ch1,ch2,ch3,ch4,ch5,ch6,ch7,ch8\r\n";
+    UINT bw;
+    f_write(&logger_file, header, (UINT)strlen(header), &bw);
+    f_sync(&logger_file);
 
     return 0;
 }
@@ -208,22 +228,29 @@ void Logger_Task(void)
         return;
     }
 
+    /* 1. Накопичення 64-бітного часу */
     uint32_t now = HAL_GetTick();
+    uint32_t delta = now - logger_last_tick;
 
-    /* Перевірка з урахуванням можливого переповнення лічильника */
-    if ((int32_t)(now - logger_next_poll_tick) < 0)
+    logger_uptime_ms += delta;
+    logger_last_tick = now;
+
+    /* 2. Перевірка періоду опитування (використовуємо наш 64-бітний таймер) */
+    static uint64_t next_poll_ms = 0U;
+
+    if (logger_uptime_ms < next_poll_ms)
     {
-        return;
+        return; /* Ще не минуло 100 мс, виходимо */
     }
 
-    logger_next_poll_tick += LOGGER_POLL_PERIOD_MS;
+    next_poll_ms = logger_uptime_ms + LOGGER_POLL_PERIOD_MS;
 
-    /* Зчитування "сирих" входів, дебаунс, виявлення змін */
+    /* 3. Зчитування "сирих" входів, дебаунс, виявлення змін */
     uint8_t sample    = Logger_ReadInputs();
     uint8_t debounced = Logger_Debounce8(sample);
-    uint8_t delta     = (uint8_t)(debounced ^ logger_prev);
+    uint8_t delta_inputs = (uint8_t)(debounced ^ logger_prev);
 
-    if (delta != 0U)
+    if (delta_inputs != 0U)
     {
         logger_prev = debounced;
         Logger_WriteLine(debounced);
